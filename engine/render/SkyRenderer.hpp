@@ -25,7 +25,7 @@ enum BindlessSlot : u32 {
     kTexGround0 = 512,        // + material·3 + {albedo, normal, ARM}   (species materials use 32–271)
 };
 // Storage-image slots (shaders/common.glsl STOR_*); 0–3 are the atmosphere LUTs.
-enum StorageSlot : u32 { kStorShadowVisNear = 4, kStorShadowVisFar = 5 };
+enum StorageSlot : u32 { kStorShadowVisNear = 4, kStorShadowVisFar = 5, kStorMotion = 6 };
 
 // Mirrors FrameRef in shaders/common.glsl.
 struct FrameUniforms {
@@ -52,6 +52,15 @@ struct FrameUniforms {
     glm::vec4 csmSplits;
     glm::vec4 csmTexel;
     glm::vec4 ground;        // rgb mean ground albedo around the camera (bounce light)
+    // Temporal upscaling (Upscaler): jitter, motion vectors, display-resolution passes.
+    glm::mat4 invViewProjEcef;      // inverse of the (jittered) viewProjEcef
+    glm::mat4 viewProjEcefNoJitter; // this frame without jitter
+    glm::mat4 viewProjEcefPrev;     // previous frame without jitter, relative to the previous camera
+    glm::mat4 viewProjNoJitter;     // ENU rotation only, no jitter (stars drawn after upscaling)
+    glm::vec4 camDelta;             // xyz current − previous camera (ECEF m), w = 1 if history valid
+    glm::vec4 upscale;              // x texture mip bias, y 2^bias (gradient scale), zw jitter (render px)
+    glm::vec4 display;              // output width, height, 1/width, 1/height
+    glm::vec4 display2;             // x pixel angle at output resolution
 };
 
 struct PushConstants {
@@ -62,6 +71,13 @@ struct PushConstants {
     u64 aux = 0;
     u64 aux2 = 0;
     u64 aux3 = 0;
+};
+
+// Per-frame upscaling parameters for the frame uniforms.
+struct UpscaleFrame {
+    VkExtent2D display{};      // output (swapchain) resolution
+    glm::vec2 jitterPx{0.0f};  // sample offset in render pixels (+x right, +y down)
+    f32 mipBias = 0.0f;        // texture LOD bias for the render/display ratio
 };
 
 class SkyRenderer {
@@ -75,13 +91,17 @@ public:
 
     // Fills this frame's uniform buffer; returns its device address.
     u64 updateFrame(u32 slot, const FrameSnapshot& snap, VkExtent2D extent, u64 frameCounter,
-                    const struct ShadowMapUniforms& shadows, const struct CascadeUniforms& cascades);
+                    const struct ShadowMapUniforms& shadows, const struct CascadeUniforms& cascades,
+                    const UpscaleFrame& up);
     [[nodiscard]] const glm::mat4& viewProjEcef() const { return viewProjEcef_; }
 
     // Before the HDR render pass: refresh sky-view LUTs (compute).
     void recordCompute(VkCommandBuffer cmd, u64 frameAddr);
     // Inside a dynamic-rendering pass on the HDR target.
     void recordSky(VkCommandBuffer cmd, u64 frameAddr, u32 slot);
+    // Stars and planets as point sources at output resolution (after upscaling, so the
+    // upscaler cannot smear or drop sub-pixel stars); occluded where render depth ≠ sky.
+    void recordStars(VkCommandBuffer cmd, u64 frameAddr, u32 slot);
 
     [[nodiscard]] u32 starCount() const { return starCount_; }
 
@@ -99,6 +119,9 @@ private:
     std::vector<Buffer> frameUniforms_; // per frame in flight, host-visible
     std::vector<Buffer> planets_;       // per frame in flight, host-visible
     glm::mat4 viewProjEcef_{1.0f};
+    glm::mat4 prevViewProjEcef_{1.0f};
+    glm::dvec3 prevCamera_{0.0};
+    bool havePrev_ = false;
 };
 
 } // namespace phx

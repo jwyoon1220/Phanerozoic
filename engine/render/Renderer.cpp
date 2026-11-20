@@ -9,6 +9,7 @@
 #include "engine/render/HiZ.hpp"
 #include "engine/render/CascadedShadows.hpp"
 #include "engine/render/PerfOverlay.hpp"
+#include "engine/render/Upscaler.hpp"
 #include "engine/render/VegetationRenderer.hpp"
 #include "engine/world/HeightField.hpp"
 
@@ -65,15 +66,31 @@ void Renderer::destroyFrameResources() {
     vkDestroySemaphore(ctx_.device, timeline_, nullptr);
 }
 
+bool Renderer::upscaling() const {
+    return UpscaleMode(mode_) != UpscaleMode::Native && upscaler_ && upscaler_->dlssAvailable();
+}
+
 void Renderer::createTargets() {
-    // Render resolution = output resolution until the upscaler lands (plan §2.8).
-    hdr_ = createImage2D(ctx_, swapchain_->extent, SkyRenderer::kHdrFormat,
-                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-    bindless_->setSampled(kTexHdr, hdr_.view);
-    depth_ = createImage2D(ctx_, swapchain_->extent, SkyRenderer::kDepthFormat,
+    // Scene at render resolution; with an upscaler active, DLSS writes the output-resolution
+    // HDR image that the star pass and the tonemapper use.
+    const VkExtent2D display = swapchain_->extent;
+    renderExtent_ = upscaling() ? upscaler_->renderExtent(UpscaleMode(mode_), display) : display;
+    hdr_ = createImage2D(ctx_, renderExtent_, SkyRenderer::kHdrFormat,
+                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    depth_ = createImage2D(ctx_, renderExtent_, SkyRenderer::kDepthFormat,
                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
     bindless_->setSampled(kTexDepth, depth_.view, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL);
-    hiz_->resize(swapchain_->extent);
+    motion_ = createImage2D(ctx_, renderExtent_, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    bindless_->setStorage(kStorMotion, motion_.view);
+    if (upscaling())
+        hdrOut_ = createImage2D(ctx_, display, SkyRenderer::kHdrFormat,
+                                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    bindless_->setSampled(kTexHdr, upscaling() ? hdrOut_.view : hdr_.view);
+    hiz_->resize(renderExtent_);
+    resetHistory_ = true;
+    log::info("Render {}x{} → output {}x{} ({})", renderExtent_.width, renderExtent_.height, display.width, display.height,
+              upscaleModeName(upscaling() ? UpscaleMode(mode_) : UpscaleMode::Native));
     if (tonemapFormat_ != swapchain_->format) {
         if (tonemapPipe_) vkDestroyPipeline(ctx_.device, tonemapPipe_, nullptr);
         tonemapPipe_ = createGraphicsPipeline(ctx_, *bindless_, {"fullscreen.vert", "tonemap.frag", swapchain_->format, false});
@@ -88,6 +105,8 @@ void Renderer::createTargets() {
 void Renderer::destroyTargets() {
     destroyImage(ctx_, hdr_);
     destroyImage(ctx_, depth_);
+    destroyImage(ctx_, motion_);
+    destroyImage(ctx_, hdrOut_);
     destroyBuffer(ctx_, readback_);
 }
 
@@ -119,10 +138,13 @@ VkCommandBuffer Renderer::beginCommandBuffer(FrameSlot& slot) {
 }
 
 void Renderer::recordFrame(VkCommandBuffer cmd, u32 imageIndex, u32 slot, u64 frameAddr, bool capture) {
-    const VkExtent2D extent = swapchain_->extent;
+    const VkExtent2D extent = renderExtent_;           // scene passes
+    const VkExtent2D display = swapchain_->extent;     // after upscaling
 
     VkViewport viewport{0, 0, f32(extent.width), f32(extent.height), 0, 1};
     VkRect2D scissor{{0, 0}, extent};
+    const VkViewport displayViewport{0, 0, f32(display.width), f32(display.height), 0, 1};
+    const VkRect2D displayScissor{{0, 0}, display};
 
     // 1. Sky-view LUTs (compute) and streamed terrain tiles (copies)
     profiler_->begin(cmd, slot, "skyLUT");
@@ -199,17 +221,93 @@ void Renderer::recordFrame(VkCommandBuffer cmd, u32 imageIndex, u32 slot, u64 fr
     profiler_->begin(cmd, slot, "forest");
     vegetation_->recordDraw(cmd, frameAddr);
     profiler_->end(cmd, slot);
-    profiler_->begin(cmd, slot, "sky+stars");
+    profiler_->begin(cmd, slot, "sky");
     sky_->recordSky(cmd, frameAddr, slot);
     profiler_->end(cmd, slot);
     vkCmdEndRendering(cmd);
     ri.pDepthAttachment = nullptr;
 
-    // 3. Tonemap to the swapchain
-    imageBarrier(cmd, hdr_.image, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+    // 3. Upscale (DLSS SR / DLAA) from render to output resolution.
+    imageBarrier(cmd, depth_.image, VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                 VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL);
+    Image* sceneOut = &hdr_;
+    if (upscaling()) {
+        profiler_->begin(cmd, slot, "dlss");
+        imageBarrier(cmd, motion_.image, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                     VK_IMAGE_LAYOUT_GENERAL);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, motionPipe_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bindless_->pipelineLayout, 0, 1, &bindless_->set, 0, nullptr);
+        PushConstants mpc{frameAddr, 0, 0, 0};
+        vkCmdPushConstants(cmd, bindless_->pipelineLayout, VK_SHADER_STAGE_ALL, 0, sizeof(mpc), &mpc);
+        vkCmdDispatch(cmd, (extent.width + 7) / 8, (extent.height + 7) / 8, 1);
+        imageBarrier(cmd, motion_.image, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        imageBarrier(cmd, hdr_.image, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        imageBarrier(cmd, hdrOut_.image, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                     VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        UpscaleInputs in;
+        in.color = &hdr_, in.depth = &depth_, in.motion = &motion_, in.output = &hdrOut_;
+        in.colorFormat = SkyRenderer::kHdrFormat, in.depthFormat = SkyRenderer::kDepthFormat;
+        in.motionFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        in.render = extent, in.display = display;
+        in.jitterPx = jitter_, in.reset = resetHistory_, in.frameMs = lastFrameMs_;
+        const bool ok = upscaler_->evaluate(cmd, UpscaleMode(mode_), in);
+        resetHistory_ = false;
+        if (!ok) { // DLSS failed this frame: plain bilinear stretch so the frame is not lost
+            imageBarrier(cmd, hdr_.image, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            imageBarrier(cmd, hdrOut_.image, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_BLIT_BIT,
+                         VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkImageBlit b{};
+            b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            b.srcOffsets[1] = {i32(extent.width), i32(extent.height), 1};
+            b.dstOffsets[1] = {i32(display.width), i32(display.height), 1};
+            vkCmdBlitImage(cmd, hdr_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hdrOut_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &b, VK_FILTER_LINEAR);
+            imageBarrier(cmd, hdrOut_.image, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_GENERAL);
+        }
+        imageBarrier(cmd, hdrOut_.image, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        profiler_->end(cmd, slot);
+        sceneOut = &hdrOut_;
+    }
+
+    // 4. Stars and planets at output resolution (point sources must not go through the upscaler).
+    {
+        VkRenderingAttachmentInfo starAtt{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        starAtt.imageView = sceneOut->view;
+        starAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        starAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        starAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo sri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        sri.renderArea = displayScissor;
+        sri.layerCount = 1;
+        sri.colorAttachmentCount = 1;
+        sri.pColorAttachments = &starAtt;
+        vkCmdBeginRendering(cmd, &sri);
+        vkCmdSetViewport(cmd, 0, 1, &displayViewport);
+        vkCmdSetScissor(cmd, 0, 1, &displayScissor);
+        profiler_->begin(cmd, slot, "stars");
+        sky_->recordStars(cmd, frameAddr, slot);
+        profiler_->end(cmd, slot);
+        vkCmdEndRendering(cmd);
+    }
+
+    // 5. Tonemap to the swapchain
+    imageBarrier(cmd, sceneOut->image, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    ri.renderArea = displayScissor;
     VkImage swapImage = swapchain_->images[imageIndex];
     imageBarrier(cmd, swapImage, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_NONE,
                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
@@ -221,8 +319,8 @@ void Renderer::recordFrame(VkCommandBuffer cmd, u32 imageIndex, u32 slot, u64 fr
     outAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     ri.pColorAttachments = &outAtt;
     vkCmdBeginRendering(cmd, &ri);
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    vkCmdSetViewport(cmd, 0, 1, &displayViewport);
+    vkCmdSetScissor(cmd, 0, 1, &displayScissor);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, bindless_->pipelineLayout, 0, 1, &bindless_->set, 0,
                             nullptr);
     PushConstants pc{frameAddr, 0, 0, 0};
@@ -242,7 +340,7 @@ void Renderer::recordFrame(VkCommandBuffer cmd, u32 imageIndex, u32 slot, u64 fr
                      VK_ACCESS_2_TRANSFER_READ_BIT, finalFrom, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         VkBufferImageCopy region{};
         region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.imageExtent = {extent.width, extent.height, 1};
+        region.imageExtent = {display.width, display.height, 1};
         vkCmdCopyImageToBuffer(cmd, swapImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_.buffer, 1, &region);
         finalFrom = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         finalStage = VK_PIPELINE_STAGE_2_COPY_BIT;
@@ -305,10 +403,19 @@ bool Renderer::renderFrame(const FrameSnapshot& snap) {
         csm_->update(c.positionEcef, fwd, right, glm::cross(right, fwd), c.fovY,
                      f32(swapchain_->extent.width) / f32(swapchain_->extent.height), sunEcef);
     }
-    const u64 frameAddr = sky_->updateFrame(slotIndex, snap, swapchain_->extent, frameNumber_,
-                                            shadows_->uniforms(snap.camera.positionEcef), csm_->uniforms());
+    // Upscaling: jitter this frame's projection, bias texture mips for the render/output ratio.
+    if (snap.upscaleMode != mode_) setUpscaleMode(snap.upscaleMode);
+    UpscaleFrame up;
+    up.display = swapchain_->extent;
+    jitter_ = upscaling() ? jitterHalton(frameNumber_, renderExtent_, up.display) : glm::vec2(0.0f);
+    up.jitterPx = jitter_;
+    up.mipBias = upscaling() ? std::log2(f32(renderExtent_.width) / f32(up.display.width)) - 1.0f : 0.0f;
+    if (glm::length(snap.camera.positionEcef - lastCamera_) > 200.0) resetHistory_ = true; // teleport / mode switch
+    lastCamera_ = snap.camera.positionEcef;
+    const u64 frameAddr = sky_->updateFrame(slotIndex, snap, renderExtent_, frameNumber_,
+                                            shadows_->uniforms(snap.camera.positionEcef), csm_->uniforms(), up);
     terrain_->update(slotIndex, snap.camera.positionEcef, sky_->viewProjEcef(), snap.camera.fovY,
-                     swapchain_->extent.height, frameNumber_ + 1);
+                     renderExtent_.height, frameNumber_ + 1);
     vegetation_->update(slotIndex, snap.camera.positionEcef, frameNumber_ + 1);
 
     overlayVisible_ = snap.perfOverlay || snap.hud.visible;
@@ -318,7 +425,8 @@ bool Renderer::renderFrame(const FrameSnapshot& snap) {
         const PerfCpuTimes cpu{lastCpu_[0], lastCpu_[1], lastCpu_[2], lastCpu_[3], lastCpu_[4]};
         overlay_->build(slotIndex, swapchain_->extent, snap.perfOverlay, snap.hud, cpu, *profiler_,
                         {ts.drawnTiles, ts.residentTiles, ts.pendingTiles, vs.instances, vs.cells, jobs_.workerCount(),
-                         jobs_.stats().executed});
+                         jobs_.stats().executed, upscaleModeName(upscaling() ? UpscaleMode(mode_) : UpscaleMode::Native),
+                         renderExtent_, swapchain_->extent});
     }
 
     // Recording is a job: workers own per-thread pools. Later passes fan out further.
@@ -388,6 +496,15 @@ bool Renderer::renderFrame(const FrameSnapshot& snap) {
     return snap.framebuffer.width == swapchain_->extent.width && snap.framebuffer.height == swapchain_->extent.height;
 }
 
+void Renderer::setUpscaleMode(u8 mode) {
+    waitTimeline(frameNumber_);
+    VK_CHECK(vkQueueWaitIdle(ctx_.graphics.queue));
+    upscaler_->releaseFeature();
+    destroyTargets();
+    mode_ = mode;
+    createTargets();
+}
+
 void Renderer::recreateSwapchain(Extent2D extent) {
     waitTimeline(frameNumber_);
     VK_CHECK(vkQueueWaitIdle(ctx_.graphics.queue));
@@ -411,6 +528,9 @@ void Renderer::threadMain() {
     shadows_ = std::make_unique<TerrainShadows>(ctx_, *bindless_, jobs_, *cfg_.heights, kFramesInFlight);
     hiz_ = std::make_unique<HiZ>(ctx_, *bindless_);
     csm_ = std::make_unique<CascadedShadows>(ctx_, *bindless_);
+    upscaler_ = std::make_unique<Upscaler>(ctx_);
+    motionPipe_ = createComputePipeline(ctx_, *bindless_, "motion.comp");
+    mode_ = snapshots_.read().upscaleMode;
     vegetation_ = std::make_unique<VegetationRenderer>(ctx_, *bindless_, jobs_, *cfg_.heights, SkyRenderer::kHdrFormat,
                                                        SkyRenderer::kDepthFormat);
     createTargets();
@@ -437,6 +557,7 @@ void Renderer::threadMain() {
         const auto now = Clock::now();
         frameMs.push_back(std::chrono::duration<f32, std::milli>(now - lastFrame).count());
         if (overlay_) overlay_->recordFrameInterval(frameMs.back());
+        lastFrameMs_ = frameMs.back();
         lastFrame = now;
         if (now - statsStart >= std::chrono::seconds(5)) {
             const double secs = std::chrono::duration<double>(now - statsStart).count();
@@ -467,6 +588,8 @@ void Renderer::threadMain() {
     destroyTargets();
     if (tonemapPipe_) vkDestroyPipeline(ctx_.device, tonemapPipe_, nullptr);
     overlay_.reset();
+    if (motionPipe_) vkDestroyPipeline(ctx_.device, motionPipe_, nullptr);
+    upscaler_.reset();
     profiler_.reset();
     vegetation_.reset();
     csm_.reset();

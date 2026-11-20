@@ -15,12 +15,12 @@ layout(location = 0) out vec4 outColor;
 
 void main() {
     uint species = vegSpecies(vPacked);
-    vec4 a = texture(gTextures[TEX_IMPOSTOR_ALBEDO0 + species], vUV);
+    vec4 a = texture(gTextures[TEX_IMPOSTOR_ALBEDO0 + species], vUV, FRAME.upscale.x);
     // Stochastic fade beyond ~3.6 km into the canopy-coloured terrain (no hard ring).
     float fade = 1.0 - smoothstep(3500.0, 4100.0, length(vCentre));
     float noise = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
     if (a.a < 0.5 || noise > fade) discard;
-    vec3 nl = texture(gTextures[TEX_IMPOSTOR_NORMAL0 + species], vUV).xyz * 2.0 - 1.0;
+    vec3 nl = texture(gTextures[TEX_IMPOSTOR_NORMAL0 + species], vUV, FRAME.upscale.x).xyz * 2.0 - 1.0;
     Surface s = makeSurface(vCentre);
     vec3 n = normalize(s.toEnu * normalize(vX * nl.x + vY * nl.y + vZ * nl.z));
     // Foliage pixels are the greener ones in the bake (bark is brown/grey).

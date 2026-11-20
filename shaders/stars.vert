@@ -36,7 +36,7 @@ void main() {
     float t = FRAME.camera.y * (9.0 + 6.0 * hash12(vec2(gl_InstanceIndex, 1.7)));
     float twinkle = 1.0 + amp * (valueNoise3(vec3(t, gl_InstanceIndex * 0.37, 0.0)) * 2.0 - 1.0);
 
-    float pixelAngle = FRAME.camera.w;
+    float pixelAngle = FRAME.display2.x; // drawn at output resolution, after upscaling
     float pixelSolidAngle = pixelAngle * pixelAngle;
     vec3 radiance = s.color * s.flux * T * twinkle / pixelSolidAngle * FRAME.camera.x; // pre-exposed, all energy in one pixel
     float peak = max(radiance.r, max(radiance.g, radiance.b));
@@ -45,14 +45,14 @@ void main() {
     sigma = min(sigma, 6.0);
     float halfSize = ceil(3.0 * sigma) + 0.5;
 
-    vec4 clip = FRAME.viewProj * vec4(dir, 1.0);
+    vec4 clip = FRAME.viewProjNoJitter * vec4(dir, 1.0);
     vec2 corner = CORNERS[gl_VertexIndex];
     vOffsetPx = corner * halfSize;
-    clip.xy += corner * halfSize * 2.0 * FRAME.resolution.zw * clip.w;
+    clip.xy += corner * halfSize * 2.0 * FRAME.display.zw * clip.w;
     vRadiance = radiance / (2.0 * PI * sigma * sigma); // normalise Gaussian over pixels
     vSigma = sigma;
     // Cull: behind the camera, invisible, or below a useful threshold.
     if (hidden || clip.w <= 0.0 || peak < 1e-4) clip = vec4(2.0, 2.0, 2.0, 1.0);
-    clip.z = 0.0; // at infinity: depth-tested EQUAL against the cleared far value (terrain occludes)
+    clip.z = 0.0; // at infinity (occlusion is tested against the scene depth in stars.frag)
     gl_Position = clip;
 }

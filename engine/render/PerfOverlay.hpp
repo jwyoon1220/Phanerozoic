@@ -21,6 +21,8 @@ struct PerfWorldStats {
     u32 natureInstances = 0, natureCells = 0;
     u32 workers = 0;
     u64 jobsExecuted = 0; // cumulative
+    const char* upscale = "native";
+    VkExtent2D render{}, display{};
 };
 
 class PerfOverlay {

@@ -9,6 +9,7 @@
 #include "engine/platform/Window.hpp"
 #include "engine/render/FrameSnapshot.hpp"
 #include "engine/render/Renderer.hpp"
+#include "engine/render/Upscaler.hpp"
 #include "engine/world/Climate.hpp"
 #include "engine/world/Environment.hpp"
 #include "engine/world/HeightField.hpp"
@@ -168,6 +169,13 @@ int runEngine(const EngineConfig& cfg) {
     if ((!scripted && cfg.startHeightAboveGround <= 3.0) || scriptedWalk > 0) startWalking();
     if (walking && !scripted) window.setCursorCaptured(true);
     if (const char* o = std::getenv("PHX_OVERLAY")) perfOverlay = o[0] != '0';
+    // Upscaling mode: PHX_DLSS = off | dlaa | quality | balanced | performance | ultra (F4 cycles).
+    u8 upscaleMode = u8(UpscaleMode::Quality);
+    if (const char* m = std::getenv("PHX_DLSS")) {
+        UpscaleMode parsed;
+        if (parseUpscaleMode(m, parsed)) upscaleMode = u8(parsed);
+        else log::warn("PHX_DLSS '{}' not understood (off|dlaa|quality|balanced|performance|ultra)", m);
+    }
 
     auto publish = [&] {
         const glm::dvec3 up = glm::normalize(camera.positionEcef);
@@ -191,6 +199,7 @@ int runEngine(const EngineConfig& cfg) {
             s.groundAlbedo = si.height < 0.0 ? glm::vec3(0.05f) : a / std::max(sum, 1e-3f);
         }
         s.perfOverlay = perfOverlay;
+        s.upscaleMode = upscaleMode;
         s.hud = {};
         if (walking && player) {
             const Vitals& v = player->vitals();
@@ -244,6 +253,10 @@ int runEngine(const EngineConfig& cfg) {
             }
             if (key == GLFW_KEY_F12) ++screenshotRequest;
             if (key == GLFW_KEY_F3) perfOverlay = !perfOverlay;
+            if (key == GLFW_KEY_F4) {
+                upscaleMode = u8((upscaleMode + 1) % u8(UpscaleMode::Count));
+                log::info("Upscaling: {}", upscaleModeName(UpscaleMode(upscaleMode)));
+            }
         }
         applyCameraInput(camera, input);
 
@@ -318,9 +331,9 @@ int runEngine(const EngineConfig& cfg) {
         if (now >= nextTitle) {
             const glm::dvec3 up = glm::normalize(camera.positionEcef);
             const f64 agl = glm::length(camera.positionEcef) - kPlanetRadiusM - std::max(heights.height(up), 0.0);
-            window.setTitle(std::format("{}  —  {}  |  alt {:.0f} m (AGL {:.0f} m)  |  {}  [F walk/fly, Tab mouse, F3 perf]",
+            window.setTitle(std::format("{}  —  {}  |  alt {:.0f} m (AGL {:.0f} m)  |  {}  |  {}  [F walk/fly, Tab mouse, F3 perf, F4 DLSS]",
                                         cfg.title, env.statusLine(), glm::length(camera.positionEcef) - kPlanetRadiusM, agl,
-                                        walking ? locomotionName(player->mode()) : "fly"));
+                                        walking ? locomotionName(player->mode()) : "fly", upscaleModeName(UpscaleMode(upscaleMode))));
             nextTitle = now + std::chrono::milliseconds(250);
         }
 

@@ -17,9 +17,9 @@ layout(location = 0) out vec4 outColor;
 void main() {
     uint species = (vMaterial >> 8) & 255u, material = vMaterial & 255u;
     bool foliage = (vMaterial & 0x10000u) != 0u;
-    vec3 albedo = texture(gTextures[treeTexture(species, material, 0u)], vUV).rgb;
-    vec3 mapN = texture(gTextures[treeTexture(species, material, 1u)], vUV).xyz * 2.0 - 1.0;
-    vec3 arm = texture(gTextures[treeTexture(species, material, 2u)], vUV).rgb;
+    vec3 albedo = texture(gTextures[treeTexture(species, material, 0u)], vUV, FRAME.upscale.x).rgb;
+    vec3 mapN = texture(gTextures[treeTexture(species, material, 1u)], vUV, FRAME.upscale.x).xyz * 2.0 - 1.0;
+    vec3 arm = texture(gTextures[treeTexture(species, material, 2u)], vUV, FRAME.upscale.x).rgb;
     // Leaf textures are JPGs (no alpha): their black surround shows as dark rims where
     // the leaf UVs overshoot the leaf shape. Cut those texels.
     if (foliage && max(albedo.r, max(albedo.g, albedo.b)) < 0.035) discard;

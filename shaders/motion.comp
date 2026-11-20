@@ -1,0 +1,22 @@
+#version 460
+#include "common.glsl"
+// Camera motion vectors for temporal upscaling: reproject each pixel's depth (render
+// resolution, jittered) into the previous frame without jitter. Output = previous −
+// current position in UV units (Upscaler scales by the render size). Sky pixels (depth 0,
+// reverse-Z) reproject as directions (w = 0), so only the camera rotation moves them.
+// Wind sway of foliage is not included (camera motion only).
+layout(local_size_x = 8, local_size_y = 8) in;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(FRAME.resolution.xy);
+    if (any(greaterThanEqual(p, size))) return;
+    float d = texelFetch(gTextures[TEX_DEPTH], p, 0).r;
+    vec2 ndc = (vec2(p) + 0.5) * FRAME.resolution.zw * 2.0 - 1.0;
+    vec4 h = FRAME.invViewProjEcef * vec4(ndc, d, 1.0); // camera-relative ECEF, homogeneous
+    vec4 cur = FRAME.viewProjEcefNoJitter * h;
+    vec4 prev = FRAME.viewProjEcefPrev * vec4(h.xyz + FRAME.camDelta.xyz * h.w, h.w);
+    vec2 mv = vec2(0.0);
+    if (FRAME.camDelta.w > 0.5 && abs(cur.w) > 1e-12 && abs(prev.w) > 1e-12)
+        mv = (prev.xy / prev.w - cur.xy / cur.w) * 0.5;
+    imageStore(gStorage[STOR_MOTION], p, vec4(mv, 0.0, 0.0));
+}

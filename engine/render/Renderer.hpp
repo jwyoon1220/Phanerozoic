@@ -7,6 +7,8 @@
 #include "engine/render/FrameSnapshot.hpp"
 
 #include <atomic>
+#include <glm/glm.hpp>
+
 #include <memory>
 #include <string>
 #include <thread>
@@ -23,6 +25,7 @@ class HiZ;
 class VegetationRenderer;
 class CascadedShadows;
 class PerfOverlay;
+class Upscaler;
 
 struct RendererConfig {
     PresentPolicy present = PresentPolicy::Vsync;
@@ -66,6 +69,7 @@ private:
     void destroyTargets();
     bool renderFrame(const FrameSnapshot& snap);
     void recreateSwapchain(Extent2D extent);
+    void setUpscaleMode(u8 mode);
     void waitTimeline(u64 value);
     VkCommandBuffer beginCommandBuffer(FrameSlot& slot);
     void recordFrame(VkCommandBuffer cmd, u32 imageIndex, u32 slot, u64 frameAddr, bool capture);
@@ -86,6 +90,18 @@ private:
     std::unique_ptr<VegetationRenderer> vegetation_;
     std::unique_ptr<CascadedShadows> csm_;
     std::unique_ptr<PerfOverlay> overlay_;
+    // Temporal upscaling (DLSS SR / DLAA): scene at render resolution → output resolution.
+    std::unique_ptr<Upscaler> upscaler_;
+    u8 mode_ = 0;                   // UpscaleMode
+    VkExtent2D renderExtent_{};
+    Image hdrOut_;                  // upscaled HDR (output resolution), stars drawn on top
+    Image motion_;                  // camera motion vectors (render resolution)
+    VkPipeline motionPipe_ = VK_NULL_HANDLE;
+    glm::vec2 jitter_{0.0f};
+    bool resetHistory_ = true;
+    f32 lastFrameMs_ = 16.7f;
+    glm::dvec3 lastCamera_{0.0};
+    [[nodiscard]] bool upscaling() const;
     VkFormat overlayFormat_ = VK_FORMAT_UNDEFINED;
     bool overlayVisible_ = false;
     f64 lastCpu_[5]{};

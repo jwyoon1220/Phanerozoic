@@ -102,7 +102,8 @@ void main() {
     float grassW = max(rest - forestW - stonyW, 0.0);
     rockW *= 1.0 - snowW;
     sandW *= 1.0 - snowW;
-    vec3 dpx = dFdx(worldPos), dpy = dFdy(worldPos); // uniform control flow
+    // Uniform control flow; scaled by the upscaler's mip bias (sharper textures at reduced render resolution).
+    vec3 dpx = dFdx(worldPos) * FRAME.upscale.y, dpy = dFdy(worldPos) * FRAME.upscale.y;
 
     // Near field: Poly Haven PBR ground materials (triplanar, world-locked).
     float detail = 1.0 - smoothstep(800.0, 1400.0, s.dist);

@@ -51,6 +51,7 @@ struct FrameSnapshot {
     f32 adaptationLuminance = 0.05f;
     u32 screenshotRequest = 0;  // increments when a capture is wanted
     bool perfOverlay = true;    // F3: performance overlay (top right)
+    u8 upscaleMode = 2;         // UpscaleMode (F4 cycles); default DLSS Quality
     PlayerHud hud;
 };
 

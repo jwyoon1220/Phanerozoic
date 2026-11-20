@@ -25,6 +25,7 @@ layout(set = 0, binding = 2, r32f) uniform image2D gStorageR32[];
 // storage slots (gStorage)
 #define STOR_SHADOW_VIS_NEAR 4
 #define STOR_SHADOW_VIS_FAR  5
+#define STOR_MOTION          6
 
 layout(buffer_reference, scalar) readonly buffer FrameRef {
     mat4 viewProj;     // rotation-only camera in ENU (x east, y north, z up)
@@ -50,6 +51,14 @@ layout(buffer_reference, scalar) readonly buffer FrameRef {
     vec4 csmSplits;    // far distance per cascade, w enabled
     vec4 csmTexel;     // world texel size per cascade, w map size
     vec4 ground;       // rgb mean ground albedo around the camera (bounce light)
+    mat4 invViewProjEcef;      // inverse of the jittered viewProjEcef
+    mat4 viewProjEcefNoJitter;
+    mat4 viewProjEcefPrev;     // previous frame, unjittered, relative to the previous camera
+    mat4 viewProjNoJitter;     // ENU rotation only, unjittered (stars after upscaling)
+    vec4 camDelta;             // xyz current − previous camera (ECEF m), w history valid
+    vec4 upscale;              // x mip bias, y 2^bias, zw jitter (render px)
+    vec4 display;              // output width, height, 1/width, 1/height
+    vec4 display2;             // x pixel angle at output resolution
 };
 
 struct GpuStar { vec3 dir; float flux; vec3 color; float pad; };

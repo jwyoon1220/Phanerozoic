@@ -135,6 +135,9 @@ void PerfOverlay::build(u32 slot, VkExtent2D extent, bool perf, const PlayerHud&
     lines.push_back({std::format("{:.0f} FPS  {:.2f} ms", fps_, avgMs_), frameColor(avgMs_)});
     lines.push_back({std::format("min {:.1f}  p99 {:.1f}  max {:.1f} ms", minMs_, p99Ms_, maxMs_), frameColor(p99Ms_)});
     const f64 cpuBusy = cpuSmooth_.update + cpuSmooth_.record + cpuSmooth_.submit;
+    lines.push_back({std::format("{} {}x{} > {}x{}", world.upscale, world.render.width, world.render.height, world.display.width,
+                                 world.display.height),
+                     kCyan});
     lines.push_back({std::format("CPU render {:.2f} ms", cpuBusy), kWhite});
     lines.push_back({std::format("upd {:.2f} rec {:.2f} sub {:.2f}", cpuSmooth_.update, cpuSmooth_.record, cpuSmooth_.submit), kGrey});
     lines.push_back({std::format("wait gpu {:.2f} acq {:.2f}", cpuSmooth_.gpuWait, cpuSmooth_.acquire), kGrey});

@@ -69,10 +69,7 @@ SkyRenderer::SkyRenderer(VulkanContext& ctx, Bindless& bindless, u32 framesInFli
     skyDesc.depthTest = true;
     skyDesc.depthCompare = VK_COMPARE_OP_EQUAL;
     skyPipe_ = createGraphicsPipeline(ctx, bindless, skyDesc);
-    GraphicsPipelineDesc starDesc = skyDesc;
-    starDesc.vertex = "stars.vert";
-    starDesc.fragment = "stars.frag";
-    starDesc.additiveBlend = true;
+    GraphicsPipelineDesc starDesc{"stars.vert", "stars.frag", kHdrFormat, true}; // additive, no depth attachment
     starsPipe_ = createGraphicsPipeline(ctx, bindless, starDesc);
 
     for (u32 i = 0; i < framesInFlight; ++i) {
@@ -135,7 +132,7 @@ void SkyRenderer::precomputeStaticLuts() {
 }
 
 u64 SkyRenderer::updateFrame(u32 slot, const FrameSnapshot& snap, VkExtent2D extent, u64 frameCounter,
-                             const ShadowMapUniforms& shadows, const CascadeUniforms& cascades) {
+                             const ShadowMapUniforms& shadows, const CascadeUniforms& cascades, const UpscaleFrame& up) {
     const CameraState& cam = snap.camera;
     const glm::vec3 forward{std::sin(cam.yaw) * std::cos(cam.pitch), std::cos(cam.yaw) * std::cos(cam.pitch),
                             std::sin(cam.pitch)};
@@ -148,11 +145,30 @@ u64 SkyRenderer::updateFrame(u32 slot, const FrameSnapshot& snap, VkExtent2D ext
     const glm::dmat3 ecefToEnu = ecefToEnuMatrix(cam.positionEcef);
     const f64 altitudeKm = (glm::length(cam.positionEcef) - kPlanetRadiusM) / 1000.0;
 
+    // Sub-pixel jitter as a clip-space shift proportional to w: the geometry moves by
+    // −jitter so that each pixel samples the scene at centre + jitter.
+    glm::mat4 jitter(1.0f);
+    jitter[3][0] = -2.0f * up.jitterPx.x / f32(extent.width);
+    jitter[3][1] = -2.0f * up.jitterPx.y / f32(extent.height);
+
     FrameUniforms u{};
-    u.viewProj = proj * view;
+    u.viewProjNoJitter = proj * view;
+    u.viewProj = jitter * u.viewProjNoJitter;
     u.ecefToEnu = glm::mat4(glm::mat3(ecefToEnu));
+    u.viewProjEcefNoJitter = u.viewProjNoJitter * u.ecefToEnu;
     u.viewProjEcef = u.viewProj * u.ecefToEnu;
+    u.invViewProjEcef = glm::inverse(u.viewProjEcef);
     viewProjEcef_ = u.viewProjEcef;
+    u.viewProjEcefPrev = havePrev_ ? prevViewProjEcef_ : u.viewProjEcefNoJitter;
+    const glm::dvec3 delta = havePrev_ ? cam.positionEcef - prevCamera_ : glm::dvec3(0.0);
+    u.camDelta = glm::vec4(glm::vec3(delta), havePrev_ ? 1.0f : 0.0f);
+    prevViewProjEcef_ = u.viewProjEcefNoJitter;
+    prevCamera_ = cam.positionEcef;
+    havePrev_ = true;
+    u.upscale = glm::vec4(up.mipBias, std::exp2(up.mipBias), up.jitterPx.x, up.jitterPx.y);
+    const VkExtent2D disp = up.display.width ? up.display : extent;
+    u.display = glm::vec4(disp.width, disp.height, 1.0f / disp.width, 1.0f / disp.height);
+    u.display2 = glm::vec4(2.0f * std::tan(cam.fovY * 0.5f) / f32(disp.height), 0, 0, 0);
     u.cameraEcef = glm::vec4(glm::vec3(cam.positionEcef), f32(kPlanetRadiusM));
     for (int l = 0; l < 2; ++l) {
         u.shadowEnu[l] = shadows.anchorEnu[l];
@@ -220,7 +236,12 @@ void SkyRenderer::recordSky(VkCommandBuffer cmd, u64 frameAddr, u32 slot) {
     vkCmdPushConstants(cmd, bindless_.pipelineLayout, VK_SHADER_STAGE_ALL, 0, sizeof(pc), &pc);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skyPipe_);
     vkCmdDraw(cmd, 3, 1, 0, 0);
+}
 
+void SkyRenderer::recordStars(VkCommandBuffer cmd, u64 frameAddr, u32 slot) {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, bindless_.pipelineLayout, 0, 1, &bindless_.set, 0,
+                            nullptr);
+    PushConstants pc{frameAddr, 0, 0, 0};
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, starsPipe_);
     if (starCount_) {
         pc.stars = stars_.address;

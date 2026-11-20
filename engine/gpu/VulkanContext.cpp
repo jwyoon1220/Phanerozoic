@@ -1,6 +1,8 @@
 #include "engine/gpu/VulkanContext.hpp"
 
+#include "engine/core/Log.hpp"
 #include "engine/platform/Window.hpp"
+#include "engine/render/Upscaler.hpp"
 
 #include <GLFW/glfw3.h>
 
@@ -132,6 +134,13 @@ void VulkanContext::createInstance(bool enableValidation) {
     std::vector<const char*> extensions(glfwExts, glfwExts + glfwCount);
     std::vector<const char*> layers;
 
+    {   // Upscaler (NGX/DLSS) requirements, where the loader offers them.
+        std::vector<const char*> ngx;
+        Upscaler::instanceExtensions(ngx);
+        for (const char* e : ngx)
+            if (hasInstanceExtension(e) && std::none_of(extensions.begin(), extensions.end(), [&](const char* x) { return !std::strcmp(x, e); }))
+                extensions.push_back(e);
+    }
     const bool debugUtils = hasInstanceExtension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     if (debugUtils) extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     if (enableValidation) {
@@ -294,6 +303,21 @@ void VulkanContext::createDevice() {
     std::vector<const char*> extensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     caps.memoryBudget = hasExt(deviceExtensions(physicalDevice), VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     if (caps.memoryBudget) extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    {   // Upscaler (NGX/DLSS) requirements. VK_EXT_buffer_device_address is skipped: the
+        // core 1.2 feature is enabled and the two must not be combined.
+        const auto available = deviceExtensions(physicalDevice);
+        std::vector<const char*> ngx;
+        Upscaler::deviceExtensions(ngx);
+        std::string list;
+        for (const char* e : ngx) {
+            if (!std::strcmp(e, "VK_EXT_buffer_device_address") || !hasExt(available, e)) continue;
+            if (std::none_of(extensions.begin(), extensions.end(), [&](const char* x) { return !std::strcmp(x, e); })) {
+                extensions.push_back(e);
+                list += std::string(" ") + e;
+            }
+        }
+        if (!list.empty()) log::info("Device extensions for NGX:{}", list);
+    }
 
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     ci.pNext = &f.core;

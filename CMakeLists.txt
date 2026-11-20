@@ -57,6 +57,53 @@ set(PROFILER_IN_DEBUG_AND_RELEASE OFF CACHE BOOL "" FORCE)
 set(CPP_RTTI_ENABLED ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(JoltPhysics)
 target_compile_options(Jolt PRIVATE -O2) # the character sweep is far too slow at -O0
+
+# NVIDIA DLSS (NGX SDK, "NVIDIA RTX SDKs" licence: data/README.md). Linux x86_64 only;
+# headers, the static NGX loader and the DLSS runtime are fetched at configure time.
+option(PHX_DLSS "NVIDIA DLSS Super Resolution / DLAA via NGX" ON)
+set(PHX_DLSS_VERSION 310.9.16)
+set(PHX_DLSS_AVAILABLE OFF)
+if (PHX_DLSS AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    set(PHX_DLSS_DIR ${CMAKE_BINARY_DIR}/_deps/dlss-sdk-${PHX_DLSS_VERSION})
+    set(PHX_DLSS_URL https://raw.githubusercontent.com/NVIDIA/DLSS/v${PHX_DLSS_VERSION})
+    set(PHX_DLSS_FILES
+        LICENSE.txt
+        lib/Linux_x86_64/libnvsdk_ngx.a
+        lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.${PHX_DLSS_VERSION})
+    foreach (h nvsdk_ngx.h nvsdk_ngx_defs.h nvsdk_ngx_defs_dlssd.h nvsdk_ngx_defs_dlssg.h nvsdk_ngx_defs_vk.h
+               nvsdk_ngx_helpers.h nvsdk_ngx_helpers_vk.h nvsdk_ngx_helpers_dlssd.h nvsdk_ngx_helpers_dlssd_vk.h
+               nvsdk_ngx_helpers_dlssg.h nvsdk_ngx_helpers_dlssg_vk.h nvsdk_ngx_params.h nvsdk_ngx_params_dlssd.h
+               nvsdk_ngx_params_dlssg.h nvsdk_ngx_vk.h)
+        list(APPEND PHX_DLSS_FILES include/${h})
+    endforeach ()
+    set(PHX_DLSS_OK ON)
+    foreach (f ${PHX_DLSS_FILES})
+        if (NOT EXISTS ${PHX_DLSS_DIR}/${f})
+            message(STATUS "DLSS SDK ${PHX_DLSS_VERSION}: downloading ${f}")
+            file(DOWNLOAD ${PHX_DLSS_URL}/${f} ${PHX_DLSS_DIR}/${f}.part STATUS st TLS_VERIFY ON)
+            list(GET st 0 code)
+            if (code EQUAL 0)
+                file(RENAME ${PHX_DLSS_DIR}/${f}.part ${PHX_DLSS_DIR}/${f})
+            else ()
+                file(REMOVE ${PHX_DLSS_DIR}/${f}.part)
+                message(WARNING "DLSS SDK download failed (${f}): ${st}; building without DLSS")
+                set(PHX_DLSS_OK OFF)
+                break()
+            endif ()
+        endif ()
+    endforeach ()
+    if (PHX_DLSS_OK)
+        add_library(phx_ngx STATIC IMPORTED)
+        set_target_properties(phx_ngx PROPERTIES
+            IMPORTED_LOCATION ${PHX_DLSS_DIR}/lib/Linux_x86_64/libnvsdk_ngx.a
+            INTERFACE_INCLUDE_DIRECTORIES ${PHX_DLSS_DIR}/include
+            INTERFACE_LINK_LIBRARIES "${CMAKE_DL_LIBS};stdc++")
+        # The DLSS runtime ("snippet") is loaded by NGX from the application directory.
+        configure_file(${PHX_DLSS_DIR}/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.${PHX_DLSS_VERSION}
+                       ${CMAKE_BINARY_DIR}/libnvidia-ngx-dlss.so.${PHX_DLSS_VERSION} COPYONLY)
+        set(PHX_DLSS_AVAILABLE ON)
+    endif ()
+endif ()
 add_library(cgltf INTERFACE)
 target_include_directories(cgltf SYSTEM INTERFACE ${cgltf_SOURCE_DIR})
 add_library(stb INTERFACE)
@@ -91,6 +138,7 @@ add_library(phx_engine STATIC
     engine/render/HiZ.cpp
     engine/render/CascadedShadows.cpp
     engine/render/PerfOverlay.cpp
+    engine/render/Upscaler.cpp
     engine/world/NaturePlacement.cpp
     engine/world/Climate.cpp
     engine/game/PhysicsWorld.cpp
@@ -112,6 +160,10 @@ target_compile_definitions(phx_engine PRIVATE
     PHX_DATA_DIR="${CMAKE_BINARY_DIR}/data"
     PHX_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data/raw/polyhaven")
 target_compile_definitions(phx_engine PUBLIC GLFW_INCLUDE_NONE)
+if (PHX_DLSS_AVAILABLE)
+    target_link_libraries(phx_engine PUBLIC phx_ngx)
+    target_compile_definitions(phx_engine PUBLIC PHX_HAS_DLSS=1 PHX_DLSS_VERSION="${PHX_DLSS_VERSION}")
+endif ()
 # Vulkan structs are initialised as `T x{sType}`; the remaining members are zeroed by design.
 target_compile_options(phx_engine PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
 set_source_files_properties(engine/game/PhysicsWorld.cpp engine/world/Climate.cpp PROPERTIES COMPILE_OPTIONS -O2)
