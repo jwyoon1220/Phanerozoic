@@ -1,0 +1,13 @@
+# Build trees (baked data, downloaded SDKs, DLSS runtime)
+build/
+cmake-build-*/
+# IDE / tool caches
+.idea/
+.cache/
+# Source data is downloaded by the build (cmake/Download.cmake, tools/assets/fetch_polyhaven.py);
+# only the licence files are kept in the repository.
+data/raw/*
+!data/raw/HYG_LICENSE
+!data/raw/paleodem/
+data/raw/paleodem/*
+!data/raw/paleodem/LICENSE.txt

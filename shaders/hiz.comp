@@ -1,0 +1,25 @@
+#version 460
+#include "common.glsl"
+// One mip of the hierarchical depth pyramid (pc.lightIndex = target mip). Reverse-Z:
+// the conservative occluder depth of a region is its MIN (farthest) depth.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    uint m = pc.lightIndex;
+    ivec2 size = imageSize(gStorageR32[m]);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, size))) return;
+    float d;
+    if (m == 0u) {
+        ivec2 src = textureSize(gTextures[TEX_DEPTH], 0);
+        ivec2 a = min(p * 2, src - 1), b = min(p * 2 + 1, src - 1);
+        d = min(min(texelFetch(gTextures[TEX_DEPTH], a, 0).r, texelFetch(gTextures[TEX_DEPTH], ivec2(b.x, a.y), 0).r),
+                min(texelFetch(gTextures[TEX_DEPTH], ivec2(a.x, b.y), 0).r, texelFetch(gTextures[TEX_DEPTH], b, 0).r));
+    } else {
+        ivec2 src = imageSize(gStorageR32[m - 1u]);
+        ivec2 a = min(p * 2, src - 1), b = min(p * 2 + 1, src - 1);
+        d = min(min(imageLoad(gStorageR32[m - 1u], a).r, imageLoad(gStorageR32[m - 1u], ivec2(b.x, a.y)).r),
+                min(imageLoad(gStorageR32[m - 1u], ivec2(a.x, b.y)).r, imageLoad(gStorageR32[m - 1u], b).r));
+    }
+    imageStore(gStorageR32[m], p, vec4(d));
+}

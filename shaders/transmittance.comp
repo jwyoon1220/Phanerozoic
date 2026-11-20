@@ -1,0 +1,22 @@
+#version 460
+#include "common.glsl"
+#include "atmosphere.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 size = imageSize(gStorage[TEX_TRANSMITTANCE]);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, size))) return;
+    float r, mu;
+    transmittanceRMu((vec2(p) + 0.5) / vec2(size), r, mu);
+    vec3 ro = vec3(0.0, 0.0, r), rd = vec3(sqrt(max(1.0 - mu * mu, 0.0)), 0.0, mu);
+    float tMax = raySphere(ro, rd, R_TOP);
+    const int STEPS = 40;
+    vec3 depth = vec3(0.0);
+    float dt = tMax / float(STEPS);
+    for (int i = 0; i < STEPS; ++i) {
+        vec3 pos = ro + rd * ((float(i) + 0.5) * dt);
+        depth += sampleMedium(length(pos) - R_BOTTOM).ext * dt;
+    }
+    imageStore(gStorage[TEX_TRANSMITTANCE], p, vec4(exp(-depth), 1.0));
+}

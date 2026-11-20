@@ -1,0 +1,80 @@
+#version 460
+#include "common.glsl"
+#include "veg_common.glsl"
+// Per-instance culling. pc.lightIndex: 0 camera (frustum + Hi-Z + LOD), 1 clamp counts,
+// 2 shadow casters per cascade (independent of the camera frustum).
+layout(local_size_x = 256) in;
+
+bool hizVisible(vec3 c, float r) {
+    vec4 clip = FRAME.viewProjEcef * vec4(c, 1.0);
+    float nearW = clip.w - r;
+    if (nearW <= FRAME.cullParams.x * 2.0) return true;
+    vec2 ndc = clip.xy / clip.w;
+    vec2 rPx = vec2(r / clip.w * FRAME.cullParams.y);
+    vec2 size = FRAME.cullParams.zw;
+    vec2 pmin = clamp((ndc * 0.5 + 0.5) * size - rPx, vec2(0.0), size - 1.0);
+    vec2 pmax = clamp((ndc * 0.5 + 0.5) * size + rPx, vec2(0.0), size - 1.0);
+    float span = max(pmax.x - pmin.x, pmax.y - pmin.y);
+    int mip = max(0, int(ceil(log2(max(span, 1.0)))) - 1);
+    ivec2 sz = imageSize(gStorageR32[mip]);
+    ivec2 a = min(ivec2(pmin) >> (mip + 1), sz - 1), b = min(ivec2(pmax) >> (mip + 1), sz - 1);
+    float occluder = min(min(imageLoad(gStorageR32[mip], a).r, imageLoad(gStorageR32[mip], ivec2(b.x, a.y)).r),
+                         min(imageLoad(gStorageR32[mip], ivec2(a.x, b.y)).r, imageLoad(gStorageR32[mip], b).r));
+    return FRAME.cullParams.x / nearW >= occluder;
+}
+
+void append(VegIndirect ind, uint bucket, vec3 rel, uint packed) {
+    uint slot = atomicAdd(ind.cmds[bucket].instanceCount, 1u);
+    if (slot < ind.capacity[bucket]) VisibleTrees(pc.aux2).v[ind.cmds[bucket].firstInstance + slot] = VisibleTree(rel, packed);
+}
+
+void main() {
+    VegIndirect ind = VegIndirect(pc.aux3);
+    uint mode = pc.lightIndex;
+    if (mode == 1u) {
+        uint b = gl_LocalInvocationID.x;
+        if (b < BUCKETS) ind.cmds[b].instanceCount = min(ind.cmds[b].instanceCount, ind.capacity[b]);
+        return;
+    }
+    VegCell cell = VegCells(pc.stars).c[gl_WorkGroupID.x];
+    uint i = gl_WorkGroupID.y * 256u + gl_LocalInvocationID.x;
+    if (i >= cell.count) return;
+    VegInstance inst = VegPool(pc.aux).v[cell.slot * VEG_MAX_PER_CELL + i];
+    uint species = vegSpecies(inst.packed);
+    float scale = vegScale(inst.packed);
+    vec4 sp = speciesA(species);
+    uint flags = uint(sp.w);
+    vec3 rel = cell.offset + inst.pos;
+    vec3 up = normalize(FRAME.cameraEcef.xyz + rel);
+    float h = sp.x * scale;
+    vec3 c = rel + up * (h * 0.5);
+    float r = length(vec2(sp.y * scale, h * 0.5));
+    float d = length(c);
+    float jitter = 0.88 + 0.24 * vegTint(inst.packed);
+
+    if (mode == 2u) {
+        if ((flags & FLAG_SHADOW) == 0u || FRAME.csmSplits.w == 0.0 || d > FRAME.csmSplits.z + r + 400.0) return;
+        uint k = species < TREE_SPECIES ? species : (species == 5u ? 3u : 4u);
+        // Small casters (boulders, dryland trees) only in the near cascades (≤ 150 m).
+        uint cascades = (species == 5u || species == 8u) ? 2u : 3u;
+        for (uint cs = 0u; cs < cascades; ++cs) {
+            vec4 lc = FRAME.csm[cs] * vec4(c, 1.0);
+            float rn = r / (FRAME.csmTexel[cs] * FRAME.csmTexel.w * 0.5);
+            if (all(lessThan(abs(lc.xy), vec2(1.0 + rn))) && lc.z < 1.0 + rn && lc.z > -rn)
+                append(ind, CAMERA_BUCKETS + cs * SHADOW_CASTERS + k, rel, inst.packed);
+        }
+        return;
+    }
+
+    mat4 m = transpose(FRAME.viewProjEcef);
+    vec4 planes[4] = vec4[](m[3] + m[0], m[3] - m[0], m[3] + m[1], m[3] - m[1]);
+    for (int k = 0; k < 4; ++k)
+        if (dot(planes[k].xyz, c) + planes[k].w < -r * length(planes[k].xyz)) return;
+
+    vec4 lodEnd = speciesLod(species);
+    uint lod = 0u;
+    while (lod < 3u && d > lodEnd[lod] * jitter) ++lod;
+    if (lod == 3u && ((flags & FLAG_IMPOSTOR) == 0u || d > lodEnd[3] * jitter)) return;
+    if (!hizVisible(c, r)) return;
+    append(ind, lod < 3u ? species * 3u + lod : SPECIES * 3u + species, rel, inst.packed);
+}

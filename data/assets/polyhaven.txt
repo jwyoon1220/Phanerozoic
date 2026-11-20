@@ -1,0 +1,20 @@
+# Poly Haven assets (CC0). Stand-ins for Eocene East-Asian flora (see data/README.md).
+model island_tree_01 1k          # Lauraceae (broadleaf evergreen) stand-in
+model fir_tree_01 1k             # Metasequoia stand-in (conical conifer; autumn tint in shader)
+model tree_small_02 1k           # Ginkgo stand-in (upright broadleaf; autumn gold in shader)
+model fern_02 1k                 # understorey ferns
+texture forest_leaves_02 2k diff nor_gl arm   # forest floor (leaf litter)
+texture forest_ground_04 2k diff nor_gl arm   # soil / moss between trees
+texture lichen_rock 2k diff nor_gl arm        # granite-like rock with lichen
+model rock_moss_set_01 1k        # forest-floor stones
+model boulder_01 1k              # boulders
+texture rock_surface 2k diff nor_gl arm       # grey granite-like cliff faces
+# Biomes (modern climate rules, engine/world/Climate)
+texture sand_01 2k diff nor_gl arm            # desert sand / dunes
+texture dry_ground_rocks 2k diff nor_gl arm   # rocky desert, bare steppe, tundra gravel
+texture sparse_grass 2k diff nor_gl arm       # grassland, savanna, alpine meadow
+texture snow_02 2k diff nor_gl arm            # permanent snow / ice
+texture forest_leaves_04 2k diff nor_gl arm   # conifer needle litter (taiga)
+model grass_medium_01 1k         # grass clumps (grassland, savanna, forest edges)
+model shrub_02 1k                # shrubs (steppe, tundra, savanna)
+model searsia_lucida 1k          # small dryland tree (savanna, desert margins)
